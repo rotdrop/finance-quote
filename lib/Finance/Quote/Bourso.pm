@@ -65,24 +65,32 @@
 require 5.005;
 
 use strict;
+use warnings;
 
 package Finance::Quote::Bourso;
 
 use vars qw( $Bourso_URL);
 
+use Data::Dumper;
 use LWP::UserAgent;
 use HTTP::Request::Common;
 use HTML::TreeBuilder
     ;    # Boursorama doesn't put data in table elements anymore but uses <div>
+use JSON qw( decode_json );
 
 # VERSION
 
-my $Bourso_URL = 'http://www.boursorama.com/recherche/index.phtml';
+my $Bourso_URL = 'http://www.boursorama.com';
 
 sub methods {
     return ( france => \&bourso,
              bourso => \&bourso,
-             europe => \&bourso
+             europe => \&bourso,
+             tradegate => \&bourso_tradegate,
+             lse => \&bourso_lse,
+             xetra => \&bourso_xetra,
+             nasdaq => \&bourso_nasdaq,
+             ebs => \&bourso_ebs
     );
 }
 {
@@ -103,7 +111,32 @@ sub bourso_to_number {
     return $x;
 }
 
+sub bourso_lse {
+    return bourso_quotes("lse", @_);
+}
+
+sub bourso_xetra {
+    return bourso_quotes("xetra", @_);
+}
+
+sub bourso_nasdaq {
+    return bourso_quotes("nasdaq", @_);
+}
+
+sub bourso_ebs {
+    return bourso_quotes("ebs", @_);
+}
+
+sub bourso_tradegate {
+    return bourso_quotes("tradegate", @_);
+}
+
 sub bourso {
+    return bourso_quotes("", @_);
+}
+
+sub bourso_quotes {
+    my $bourse = shift;
     my $quoter = shift;
     my @stocks = @_;
     my ( %info, $reply, $url, $te, $ts, $row, $style );
@@ -112,211 +145,158 @@ sub bourso {
     $url = $Bourso_URL;
 
     foreach my $stocks (@stocks) {
-        my $queryUrl =
-              $url
-            . join( '', "?q=", $stocks )
-            . "&search[type]=rapide&search[categorie]=STK&search[bourse]=country:33";
+
+        my $queryUrl = $url . '/recherche/' . $stocks;
+
         $reply = $ua->request( GET $queryUrl);
+        #print "URL=".$queryUrl."\n";
 
-        # print "URL=".$queryUrl."\n";
+        unless ( $reply->is_success ) {
+            $info{ $stocks, "success" }  = 0;
+            $info{ $stocks, "errormsg" } = "Error retreiving $stocks";
+            next;
+        }
 
-        if ( $reply->is_success ) {
+        my $tree = HTML::TreeBuilder->new_from_content( Encode::decode_utf8( $reply->content ) );
 
-            # print $reply->content;
-            $info{ $stocks, "success" } = 1;
+        unless ($bourse eq "") {
 
-            my $tree = HTML::TreeBuilder->new_from_content( $reply->content );
-
-            # retrieve SYMBOL
-            my @symbolline = $tree->look_down( 'class', 'seoinline fv-isin ellipsis' );
-
-            unless (@symbolline) {
+            my @titleLine = $tree->look_down( "_tag", "title");
+            unless (@titleLine) {
                 $info{ $stocks, "success" }  = 0;
-                $info{ $stocks, "errormsg" } = "Stock name $stocks not found";
+                $info{ $stocks, "errormsg" } = "Error retreiving $stocks";
                 next;
             }
 
-            my $symbol = ( $symbolline[0]->content_list )[0];
-            ($symbol) = ( $symbol =~ m/(\w+)/ );
-            $info{ $stocks, "symbol" } = $symbol;
+            my $title = $titleLine[0]->as_text;
+            unless ($title =~ qr/$bourse/i) {
 
-            # retrieve NAME
-            my @nameline = $tree->look_down( 'class', 'fv-name' );
+                my $queryBoursesUrl = $url . "/bourse/cours/ajax/autres-places-de-quotation/" . $stocks;
+                $reply = $ua->request( GET $queryBoursesUrl);
+                #print "URL=".$queryBoursesUrl."\n";
 
-            unless (@nameline) {
-                $info{ $stocks, "success" } = 0;
-                $info{ $stocks, "errormsg" } =
-                    "Stock name $stocks not retrievable";
-                next;
-            }
-
-            my $name = $nameline[0]->as_text;
-            $info{ $stocks, "name" } = $name;
-
-            # set method
-            $info{ $stocks, "method" } = "bourso";
-
-            #holds table data
-            my %tempinfo;
-
-            # retrieve other data
-            my $infoclass = ( $tree->look_down( 'class', 'fv-extras' ) )[0];
-            unless ($infoclass) {
-                my $opcvm =
-                    ( $tree->look_down( 'class', 'opcvm-partners block' ) )[0];
-                unless ($opcvm) {
-                    $info{ $stocks, "success" } = 0;
-                    $info{ $stocks, "errormsg" } =
-                        "$stocks retrieval not supported.";
+                unless ( $reply->is_success ) {
+                    $info{ $stocks, "success" }  = 0;
+                    $info{ $stocks, "errormsg" } = "Error retreiving $stocks";
                     next;
                 }
 
-                # the stock is a delayed OPCVM
+                $tree->delete;
+                $tree = HTML::TreeBuilder->new_from_content( Encode::decode_utf8( $reply->content ) );
 
-                my $infoelem =
-                    ( $tree->look_down( 'id', 'quote-infos-page' ) )[0];
-                $infoelem =
-                    ( $infoelem->look_down( 'class', 'q-details span-1-2' ) )
-                    [0];
+                # <a href="/cours/1zTL0/" title="Nom de place boursière" class="c-link   c-link--animated / o-ellipsis">XETRA</a>
+                my @bourses = $tree->look_down( "_tag", "a", "title", qr/Nom de place bours/);
+                #print Dumper(\@bourses);
 
-                my @rows = $infoelem->look_down( '_tag', 'tr' );
-                foreach my $i ( 0 .. $#rows ) {
-                    my $row = $rows[$i];
-                    unless ( $row->attr('class') ) {
-                        next;
+                $queryUrl = "";
+                foreach my $bourseLink (@bourses) {
+
+                    my $bourseName = $bourseLink->as_text;
+                    if ($bourseName =~ qr/$bourse/i) {
+                        $queryUrl = $url . $bourseLink->attr('href');
+                        #print "url: ".$bourseLink->as_text.": ".$queryUrl."\n";
+                        last;
                     }
-
-                    my @cells     = $row->look_down( '_tag', 'td' );
-                    my $keytext   = ( $cells[0] )->as_text;
-                    my $valuetext = ( $cells[2] )->as_text;
-
-                    $tempinfo{$keytext} = $valuetext;
                 }
-            }
-            else {
-                # regular stock
 
-                my $infoelem;
-                my $quote_infos_page =
-                    ( $tree->look_down( 'id', 'quote-infos-page' ) )[0];
-                $infoelem = ( $quote_infos_page->look_down(
-                                                   'class', 'q-details span-1-2'
-                              )
-                )[0];
-                $infoelem = ( $quote_infos_page->look_down( 'class', 'bd' ) )[0]
-                    if ( !defined $infoelem );    # needed for warrants
-
-                my @rows = $infoelem->look_down( '_tag', 'tr' );
-                foreach my $i ( 0 .. $#rows ) {
-                    my $row   = $rows[$i];
-                    my @cells = $row->look_down( '_tag', 'td' );
-                    my $j     = 0;
-                    if ( $cells[0]->attr('rowspan') ) {
-                        $j = 1;
-                    }
-                    if ( $cells[0]->attr('colspan') ) {
-                        next;
-                    }
-
-                    my $keytext   = ( $cells[$j] )->as_text;
-                    my $valuetext = ( $cells[ $j + 1 ] )->as_text;
-
-                    $tempinfo{$keytext} = $valuetext;
+                unless ($queryUrl ne "") {
+                    $info{ $stocks, "success" }  = 0;
+                    $info{ $stocks, "errormsg" } = "Stock name $stocks on bourse $bourse not found";
+                    next;
                 }
+
+                $reply = $ua->request( GET $queryUrl);
+                #print "URL=".$queryUrl."\n";
+
+                unless ( $reply->is_success ) {
+                    $info{ $stocks, "success" }  = 0;
+                    $info{ $stocks, "errormsg" } = "Error retreiving $stocks";
+                    next;
+                }
+
+                $tree = HTML::TreeBuilder->new_from_content( Encode::decode_utf8( $reply->content ) );
+
             }
 
-            foreach my $key ( keys %tempinfo ) {
-
-                # print "$key -> $tempinfo{$key}\n";
-
-            ASSIGN: for ($key) {
-
-                    # OPCVM
-                    /Valeur liquidative/ && do {
-                        my ( $last, $currency ) =
-                            ( $tempinfo{$key}
-                            =~ m/(\d+(?:\s\d+)*(?:\.\d+)?)(?:\(c\))?(?:\s+(\w+))?/
-                            );
-                        $last = bourso_to_number($last);
-                        $info{ $stocks, "last" }     = $last;
-                        $info{ $stocks, "currency" } = $currency;
-                    };
-                    /Date/ && do {
-                        $info{ $stocks, "date" } = $tempinfo{$key};
-                        $quoter->store_date( \%info, $stocks,
-                                     { eurodate => $info{ $stocks, "date" } } );
-                    };
-                    /Variation Veille/ && do {
-                        $info{ $stocks, "p_change" } = $tempinfo{$key};
-                    };
-
-                    # REGULAR STOCK
-                    /Cours/ && do {
-                        my ( $last, $currency ) =
-                            ( $tempinfo{$key}
-                            =~ m/(\d+(?:\s\d+)*(?:\.\d+)?)(?:\(c\))?(?:\s+(\w+))?/
-                            );
-                        $last = bourso_to_number($last);
-                        $info{ $stocks, "last" } = $last;
-                        $info{ $stocks, "currency" } =
-                            $currency || "EUR";    # defaults to EUR
-                        my $exchange = $key;
-                        $exchange =~ s/.*Cours\s*(\w.*\w)\s*/$1/
-                            ;    # the exchange is in the $key here
-                        $info{ $stocks, "exchange" } = $exchange;
-                    };
-                    /Variation/ && do {
-                        $info{ $stocks, "p_change" } = $tempinfo{$key};
-                    };
-                    /Dernier .change/ && do {
-                        my ( $day, $month, $year ) =
-                            ( $tempinfo{$key} =~ m|(\d\d)/(\d\d)/(\d\d)| );
-                        $year += 2000;
-                        $info{ $stocks, "date" } = sprintf "%02d/%02d/%04d",
-                            $day, $month, $year;
-                        $quoter->store_date( \%info, $stocks,
-                                     { eurodate => $info{ $stocks, "date" } } );
-                    };
-                    /Volume/ && do {
-                        $info{ $stocks, "volume" } =
-                            bourso_to_number( $tempinfo{$key} );
-                    };
-                    /Ouverture/ && do {
-                        $info{ $stocks, "open" } =
-                            bourso_to_number( $tempinfo{$key} );
-                    };
-                    /Haut/ && do {
-                        $info{ $stocks, "high" } =
-                            bourso_to_number( $tempinfo{$key} );
-                    };
-                    /Bas/ && do {
-                        $info{ $stocks, "low" } =
-                            bourso_to_number( $tempinfo{$key} );
-                    };
-                    /Cl.ture veille/ && do {
-                        $info{ $stocks, "previous" } =
-                            bourso_to_number( $tempinfo{$key} );
-                    };
-                    /Valorisation/ && do {
-                        $info{ $stocks, "cap" } = $tempinfo{$key};
-                        $info{ $stocks, "cap" } =~ s/[A-Z\s]//g
-                            ; # remove spaces and 'M' (millions) and currency (when not EUR)
-                        $info{ $stocks, "cap" }
-                            =~ tr/,/./;    # point instead of comma
-                        $info{ $stocks, "cap" }
-                            *= 1000000;    # valorisation is in millions
-                    };
-                }
-            }
-            $tree->delete;
         }
-        else {
+
+        # print $reply->content;
+        $info{ $stocks, "success" } = 1;
+
+        # retrieve SYMBOL
+        my @symbolline = $tree->look_down( 'class', 'c-faceplate__isin' );
+
+        unless (@symbolline) {
             $info{ $stocks, "success" }  = 0;
-            $info{ $stocks, "errormsg" } = "Error retreiving $stocks ";
+            $info{ $stocks, "errormsg" } = "Stock name $stocks not found";
+            next;
         }
+
+        my $symbol = ( $symbolline[0]->content_list )[0];
+
+
+        ($symbol) = ( $symbol =~ m/(\w+)/ );
+        $info{ $stocks, "symbol" } = $symbol;
+
+        # retrieve NAME
+        my @nameline = $tree->look_down( 'class', 'c-faceplate__company-link' );
+
+        unless (@nameline) {
+            $info{ $stocks, "success" } = 0;
+            $info{ $stocks, "errormsg" } =
+              "Stock name $stocks not retrievable";
+            next;
+        }
+
+        my $name = $nameline[0]->as_text;
+        $name =~ s/^\s+|\s+$//g;
+        $info{ $stocks, "name" } = $name;
+
+        # set method
+        $info{ $stocks, "method" } = "bourso";
+
+        # In principle we have everything but the currency as JSON
+        my @jsondata_ = JSON::decode_json($nameline[0]->attr_get_i('data-ist-init'));
+        my %jsondata = %{ $jsondata_[0] };
+        #print Dumper(\%jsondata);
+
+        unless ($jsondata{ 'last' }) {
+            $info{ $stocks, "success" } = 0;
+            $info{ $stocks, "errormsg" } =
+              "Stock price of $stocks not retrievable";
+            next;
+        }
+
+        # get currency from displayed "last"
+        my @curline = $tree->look_down('class', 'c-faceplate__price-currency');
+        unless (@curline) {
+            $info{ $stocks, "success" } = 0;
+            $info{ $stocks, "errormsg" } =
+              "Stock currency of $stocks not retrievable";
+            next;
+        }
+        my $currency = $curline[0]->as_text;
+        $currency =~ s/^\s+|\s+$//g;
+
+        #print "CUR '$currency'\n";
+        $info{ $stocks, "currency" } = $currency;
+        $info{ $stocks, "last" } = $jsondata{ "last" };
+        $info{ $stocks, "date" } = substr($jsondata{ "tradeDate" }, 0, 10);
+        $info{ $stocks, "isodate" } = substr($jsondata{ "tradeDate" }, 0, 10);
+        $quoter->store_date( \%info, $stocks,
+                             {
+                              isodate => $info{ $stocks, "date" } } );
+        $info{ $stocks, "time" } = substr($jsondata{ "tradeDate" }, 11, 8);
+        $info{ $stocks, "volume" } = $jsondata{ 'totalVolume' };
+        $info{ $stocks, "high" } = $jsondata{ 'high' };
+        $info{ $stocks, "low" } = $jsondata{ 'low' };
+        $info{ $stocks, "previous" } = $jsondata{ 'previousClose' };
+
+        delete $info{ $stocks, "errormsg" };
+
+        $tree->delete;
     }
     return wantarray() ? %info : \%info;
-    return \%info;
 }
 1;
 
