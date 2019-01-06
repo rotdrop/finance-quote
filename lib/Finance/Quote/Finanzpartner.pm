@@ -1,5 +1,6 @@
 # Finance::Quote Perl module to retrieve quotes from Finanzpartner.de
 #    Copyright (C) 2007  Jan Willamowius <jan@willamowius.de>
+#                  2017  Claus-Justus Heine <himself@claus-justus-heine.de>
 #
 #    This program is free software; you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -18,7 +19,9 @@
 package Finance::Quote::Finanzpartner;
 
 use strict;
-use HTML::TableExtract;
+use open ':std', ':encoding(UTF-8)';
+use utf8;
+use Web::Query qw();
 
 # VERSION
 
@@ -31,17 +34,19 @@ sub labels { return (finanzpartner=>[qw/name date price last method/]); } # TODO
 sub trim
 {
 	$_ = shift();
+	s/&nbsp;/ /g;
+	s/\240/ /g;
+	s/\302/ /g;
 	s/^\s*//;
 	s/\s*$//;
-	s/&nbsp;//g;
 	return $_;
 }
 
 # Convert number separators to US values
 sub convert_price {
-	$_ = shift;
+        $_ = shift;
         tr/.,/,./ ;
-	return $_;
+        return $_;
 }
 
 sub finanzpartner
@@ -58,25 +63,88 @@ sub finanzpartner
 		if (!$response -> is_success()) {
 			$info{$stock,"errormsg"} = "HTTP failure";
 		} else {
-			my $te = HTML::TableExtract->new(depth => 0, count => 2);
-			$te->parse($response->content);
-			my $table = $te->first_table_found;
+			my $date;
+			my $wkn;
+			my $isin;
+			my $name;
+			my $exchange;
+			my $lastOut;
+			my $outCurrency;
+			my $lastIn;
+			my $inCurrency;
+			my $currency;
+			my $volume;
+			my $volumeCurrency;
 
-			if (trim($table->cell(1,0)) ne 'Fondsname:') {
-				$info{$stock,"errormsg"} = "Couldn't parse website";
-			} else {
-				$info{$stock,"name"} = $table->cell(1,1);
-				my $quote = $table->cell(6,1);
-				my @part = split(/\s/, $quote);
-				$info{$stock,"currency"} = $part[1];
-				$part[2] =~ s/\(//g;
-				$part[2] =~ s/\)//g;
-				$quoter->store_date(\%info, $stock, {eurodate => $part[2]});
-				$info{$stock,"price"} = convert_price(trim($part[0]));
-				$info{$stock,"last"} = $info{$stock,"price"};
-				$info{$stock,"success"} = 1;
-				$info{$stock,"method"} = "finanzpartner";
-				$info{$stock,"symbol"} = $stock;
+			my $parser = Web::Query->new_from_html($response->content);
+			my $cols = $parser->find('.row');
+
+			$cols->each(sub {
+					    my ($i, $elem) = @_;
+					    my $rows = $elem->find('.col-sm-3');
+
+					    my $cells = $elem->find('div[class^="col-sm-"]');
+
+					    $cells->each(sub {
+								 my ($i, $elem) = @_;
+								 my $text = trim($elem->text);
+								 if ($text eq 'Wertpapierkennziffer:') {
+									 $wkn = trim($elem->next->text);
+								 } elsif ($text eq 'ISIN:') {
+									 $isin = trim($elem->next->text);
+								 } elsif ($text eq 'Fondsname:') {
+									 $name = trim($elem->next->text);
+								 } elsif ($text eq 'Investmentgesellschaft:') {
+									 $exchange = trim($elem->next->text);
+								 } elsif ($text eq 'Fondsvolumen:') {
+									 $volume = trim($elem->next->text);
+									 if ($volume =~ /([0-9]+[.][0-9]+,[0-9]+)\s*(Mio.)?\s+([A-Z]+)/) {
+										 $volume = $1;
+										 my $volumeUnits = $2;
+										 $volumeCurrency = $3;
+										 $volume = convert_price($volume);
+										 $volume =~ s/,//g;
+										 if ($volumeUnits eq 'Mio.') {
+											 $volume *= 1e6;
+										 }
+									 }
+								 } elsif ($text =~ /^Aktueller Kurs:.*vom ([0-9][0-9][.][0-9][0-9][.][0-9][0-9][0-9][0-9])/) {
+									 $date = $1;
+									 my $subCells = $elem->next->find('.col-xs-6');
+									 $subCells->each(sub {
+												 my ($i, $elem) = @_;
+												 my $text = trim($elem->text);
+												 if ($text =~ /^Ausgabe-Kurs:/) {
+													 $lastOut = trim($elem->next->text);
+													 if ($lastOut =~ /([0-9]+[.][0-9][0-9])\s+([A-Z]+)/) {
+														 $lastOut = $1;
+														 $outCurrency = $2;
+													 }
+												 } elsif ($text =~ /^R[^c]+cknahme-Kurs:/) {
+													 $lastIn = trim($elem->next->text);
+													 if ($lastIn =~ /([0-9]+[.][0-9][0-9])\s+([A-Z]+)/) {
+														 $lastIn = $1;
+														 $inCurrency = $2;
+													 }
+												 }
+											 });
+								 }
+							 });
+				    });
+
+#			print "$stock $isin $wkn\n";
+			if ($stock eq $isin || $stock eq $wkn) {
+				# got it
+				$info{$stock, "method"} = "finanzpartner";
+				$info{$stock, "symbol"} = $stock;
+				$info{$stock, "name"} = $name;
+				$info{$stock, "exchange"} = $exchange;
+				$info{$stock, "volume"} = $volume;
+				$quoter->store_date(\%info, $stock, {eurodate => $date});
+				$info{$stock, "currency"} = $inCurrency;
+				$info{$stock, "price" } = $lastIn;
+				$info{$stock, "last" } = $info{$stock, "price"};
+				$info{$stock, "success"} = 1;
 			}
 		}
 	}
@@ -104,7 +172,7 @@ This module obtains quotes from Finanzpartner.de (http://www.finanzpartner.de) b
 =head1 LABELS RETURNED
 
 The following labels may be returned by Finance::Quote::Finanzpartner:
-name, date, price, last, method.
+exchange, name, date, price, last, method, volume.
 
 =head1 SEE ALSO
 
