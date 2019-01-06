@@ -126,10 +126,9 @@ sub dwsfunds {
 
 	if ($response->is_success) {
 		$html_string =$response->content;
-
-		$te = new HTML::TableExtract->new( depth => 3, count => 1 );
+		$te = new HTML::TableExtract->new( depth => 2, count => 2 );
 		$te->parse($html_string);
-		$ts=$te->table_state(3,1);
+		$ts=$te->table_state(2,2);
 	} else {
 		# retrieval error - flag an error and return right away
 		foreach my $fund (@funds) {
@@ -179,6 +178,9 @@ sub dwsfunds {
 		$wkn=$ce4[1];
 		$isin=$ce4[2];
 
+		$wkn =~ s/^\s+|\s+$//g;
+		$isin =~ s/^\s+|\s+$//g;
+		
 		# match the fund by symbol
 		foreach my $fund (@funds) {
 			if (  ($wkn eq $fund) or ($isin eq $fund) ) {
